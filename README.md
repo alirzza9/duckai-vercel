@@ -52,6 +52,31 @@ The bot's `DUCKAI_URL` becomes `https://<project>.vercel.app/api`
   challenge variants, or rate-limit at any time. Intermittent HTTP 418
   `challenge_rejected` is inherent (~25–30% in VM runs); the caller should
   retry once on 418 with a fresh request, then fall back.
+
+## Diagnostics (2026-11-09)
+
+- "POST /api/chat hangs" was **not the service**: from the Muse VM, every
+  HTTPS request carrying a body (POST/PUT) hangs with 0 bytes received
+  through the VM's egress proxy — including POSTs to httpbin.org and
+  example.com, in both curl and Node fetch — while GET/HEAD/OPTIONS work.
+  The same POSTs succeed instantly via an alternate egress (Nightline
+  SOCKS): POST /api/health → 200 in ~2.3 s, POST /api/chat → 401 in ~2 s
+  without a token. So if a POST appears to hang, re-test from a different
+  network before blaming this code. (Vercel request logs staying empty for
+  such POSTs is consistent with the requests never arriving.)
+- Separate open question: after the fix, the live Vercel deployment
+  returned HTTP 418 on 5 consecutive authenticated chat calls (each
+  completing in ~1 s), while the same code on the VM returned 200 on 6/6
+  local runs the same evening. If 418s persist after redeploy, check the
+  new stage logs (`hs.status_ok` variant + `chat.post_ok`) in Vercel's
+  runtime logs — duck.ai may be serving Vercel's egress IPs a challenge
+  variant the shim does not cover, or rejecting proofs from those IPs.
+- Hardening in `api/chat.js` (2026-11-09): every response-body read
+  (`home.text()`, SSE `resp.text()`) is now bounded by a real timeout
+  (previously `fetchWithTimeout` only bounded time-to-headers), the
+  challenge solve has a 15 s race timeout, stage logs mark each step, and
+  `readBody` coerces string chunks to Buffers (a raw-stream read with
+  string chunks used to crash `Buffer.concat`).
 - No sensitive data through this service: duck.ai may retain prompts.
 - Logs carry counts / latencies / error codes only — never prompt or reply
   content.
