@@ -14,6 +14,7 @@ const BASE = 'https://duck.ai';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const CHAT_TIMEOUT_MS = 30_000;
+const SOLVE_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_MESSAGES = 40;
 
@@ -53,14 +54,51 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   }
 }
 
+// Race any promise against a timer. The timer bounds the WAIT: the caller
+// gets a coded error and returns an error JSON instead of hanging forever.
+// NOTE: fetchWithTimeout above only bounds time-to-headers — once fetch
+// resolves, its timer is cleared, so a stalled response BODY (resp.text())
+// was previously unbounded. Every body read below goes through
+// readTextWithTimeout instead.
+function withTimeout(promise, ms, code) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { code })), ms);
+  });
+  return Promise.race([
+    promise.then((v) => { clearTimeout(timer); return v; },
+      (e) => { clearTimeout(timer); throw e; }),
+    timeout,
+  ]);
+}
+
+async function readTextWithTimeout(resp, ms, code) {
+  let timedOut = false;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(Object.assign(new Error('body read timeout'), { code }));
+    }, ms);
+  });
+  try {
+    return await Promise.race([resp.text().finally(() => clearTimeout(timer)), timeout]);
+  } catch (e) {
+    if (timedOut) { try { if (resp.body) await resp.body.cancel(); } catch {} }
+    throw e;
+  }
+}
+
 // Fresh handshake per request: homepage -> fe_version, status -> challenge,
 // solve in vm realm, build proof. Never cached (proofs expire in minutes).
 async function freshProof() {
+  const t0 = Date.now();
   const home = await fetchWithTimeout(`${BASE}/`, {
     headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' },
   }, HANDSHAKE_TIMEOUT_MS);
   if (!home.ok) throw Object.assign(new Error('homepage'), { code: 'duckai_homepage', status: home.status });
-  const html = await home.text();
+  const html = await readTextWithTimeout(home, HANDSHAKE_TIMEOUT_MS, 'duckai_home_timeout');
+  log({ ev: 'hs', stage: 'home_ok', status: home.status, bytes: html.length, ms: Date.now() - t0 });
   const tag = html.match(/data-version-tag="([^"]*)"/)?.[1] || 'dev';
   const sha = html.match(/data-version-sha="([^"]*)"/)?.[1] || 'hash';
   const feVersion = `${tag}-${sha}`;
@@ -83,10 +121,14 @@ async function freshProof() {
     : src.includes('innerHTML') ? 'A-innerHTML'
     : src.includes('offsetWidth') ? 'B-layout'
     : src.includes('toString.call(window)') ? 'D-integrity' : 'unknown';
-  const solved = await solveChallenge(src, { beVersion: tag, feHash: sha });
+  log({ ev: 'hs', stage: 'status_ok', status: st.status, variant, ms: Date.now() - t0 });
+  const solved = await withTimeout(
+    Promise.resolve().then(() => solveChallenge(src, { beVersion: tag, feHash: sha })),
+    SOLVE_TIMEOUT_MS, 'duckai_solve_timeout');
   if (!solved || solved.__error) {
     throw Object.assign(new Error('solve failed'), { code: 'duckai_solve_failed' });
   }
+  log({ ev: 'hs', stage: 'solved', variant, ms: Date.now() - t0 });
   return { feVersion, proof: buildProof(solved), variant };
 }
 
@@ -101,6 +143,7 @@ function toDuckMessages(messages) {
 }
 
 async function chatOnce(messages, model) {
+  const t0 = Date.now();
   const { feVersion, proof, variant } = await freshProof();
   const body = {
     model,
@@ -129,6 +172,7 @@ async function chatOnce(messages, model) {
     },
     body: JSON.stringify(body),
   }, CHAT_TIMEOUT_MS);
+  log({ ev: 'chat', stage: 'post_ok', status: resp.status, variant, ms: Date.now() - t0 });
 
   if (resp.status === 418) {
     throw Object.assign(new Error('challenge rejected (418)'), { code: 'challenge_rejected', status: 418, retryable: true, variant });
@@ -143,7 +187,8 @@ async function chatOnce(messages, model) {
     throw Object.assign(new Error(`duck.ai HTTP ${resp.status}`), { code: 'duckai_http', status: resp.status, variant });
   }
 
-  const text = await resp.text();
+  const text = await readTextWithTimeout(resp, CHAT_TIMEOUT_MS, 'duckai_sse_timeout');
+  log({ ev: 'chat', stage: 'sse_read', bytes: text.length, variant, ms: Date.now() - t0 });
   let reply = '';
   for (const line of text.split('\n')) {
     if (!line.startsWith('data: ')) continue;
@@ -180,9 +225,11 @@ function readBody(req) {
     let size = 0;
     const chunks = [];
     req.on('data', (c) => {
-      size += c.length;
+      // Coerce: some runtimes deliver string chunks; Buffer.concat needs Buffers.
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
+      size += buf.length;
       if (size > MAX_BODY_BYTES) { reject(Object.assign(new Error('body too large'), { code: 'body_too_large' })); req.destroy(); return; }
-      chunks.push(c);
+      chunks.push(buf);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
