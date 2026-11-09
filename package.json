@@ -1,0 +1,1 @@
+{"description":"Duck.ai solver + chat service as Vercel serverless functions (zero dependencies)","engines":{"node":">=20"},"name":"duckai-vercel","private":true,"version":"1.0.0"}
